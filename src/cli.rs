@@ -1,9 +1,10 @@
-//! Command-line mode and the control socket used by a running TUI.
+//! Command-line mode and the control endpoint used by a running TUI.
 //!
 //! Starting the binary without arguments opens the TUI as usual. Any argument
 //! switches to CLI mode. Commands that only need the local database or the
 //! online catalogs (`search`, `liked`, `stats`, `local`, ...) work on their
-//! own; playback commands are sent to a running TUI over a Unix socket.
+//! own; playback commands are sent to a running TUI over a Unix socket on
+//! Unix and over an authenticated loopback socket on Windows.
 
 use crate::api::{self, Source, Track};
 use crate::app::{App, Command as AppCommand, RepeatMode, ViewMode};
@@ -15,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::{mpsc, oneshot};
 
 const REMOTE_COMMANDS: &[&str] = &[
@@ -34,6 +35,10 @@ pub struct CliRequest {
     pub limit: Option<usize>,
     #[serde(default)]
     pub json: bool,
+    /// Authentication token for the Windows localhost control endpoint.
+    /// Unix sockets already restrict access through filesystem permissions.
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -233,14 +238,14 @@ fn view_name(view: &ViewMode) -> &'static str {
 /// Expand a leading `~` in a user-supplied path.
 pub fn expand_path(value: &str) -> PathBuf {
     if value == "~" {
-        return std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from(value));
+        return crate::paths::home_dir();
     }
     if let Some(rest) = value.strip_prefix("~/") {
-        if let Some(home) = std::env::var_os("HOME") {
-            return PathBuf::from(home).join(rest);
-        }
+        return crate::paths::home_dir().join(rest);
+    }
+    #[cfg(windows)]
+    if let Some(rest) = value.strip_prefix("~\\") {
+        return crate::paths::home_dir().join(rest);
     }
     PathBuf::from(value)
 }
@@ -924,6 +929,7 @@ fn run_config(flags: Flags) -> i32 {
             "data": paths::data_dir(),
             "downloads": paths::downloads_dir(),
             "database": db_path,
+            "control": endpoint_display(),
             "yandex_token": !cfg.yandex_token.is_empty(),
             "soundcloud_client_id": !cfg.soundcloud_client_id.is_empty(),
             "lastfm_api_key": !cfg.lastfm_api_key.is_empty(),
@@ -961,7 +967,7 @@ fn run_config(flags: Flags) -> i32 {
                 "set"
             }
         );
-        println!("Socket:    {}", socket_path().display());
+        println!("Control:   {}", endpoint_display());
     }
     0
 }
@@ -1032,6 +1038,7 @@ async fn run_remote(command: &str, flags: Flags) -> i32 {
         source: flags.source,
         limit: flags.limit,
         json: flags.json,
+        token: None,
     };
     match send_request(&request).await {
         Ok(response) => {
@@ -1068,16 +1075,40 @@ async fn run_remote(command: &str, flags: Flags) -> i32 {
 }
 
 async fn send_request(request: &CliRequest) -> Result<CliResponse, String> {
-    let path = socket_path();
-    let stream = tokio::time::timeout(
-        Duration::from_secs(2),
-        tokio::net::UnixStream::connect(&path),
-    )
-    .await
-    .map_err(|_| format!("timed out connecting to {}", path.display()))?
-    .map_err(|e| format!("{e} ({})", path.display()))?;
-    let (read_half, mut write_half) = stream.into_split();
-    let mut line = serde_json::to_vec(request).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        let path = socket_path();
+        let stream = tokio::time::timeout(
+            Duration::from_secs(2),
+            tokio::net::UnixStream::connect(&path),
+        )
+        .await
+        .map_err(|_| format!("timed out connecting to {}", path.display()))?
+        .map_err(|e| format!("{e} ({})", path.display()))?;
+        exchange(stream, request.clone()).await
+    }
+
+    #[cfg(windows)]
+    {
+        let control = read_control_file()?;
+        let addr = std::net::SocketAddr::from(([127, 0, 0, 1], control.port));
+        let stream =
+            tokio::time::timeout(Duration::from_secs(2), tokio::net::TcpStream::connect(addr))
+                .await
+                .map_err(|_| format!("timed out connecting to {addr}"))?
+                .map_err(|e| format!("{e} (127.0.0.1:{})", control.port))?;
+        let mut request = request.clone();
+        request.token = Some(control.token);
+        exchange(stream, request).await
+    }
+}
+
+async fn exchange<S>(stream: S, request: CliRequest) -> Result<CliResponse, String>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let (read_half, mut write_half) = tokio::io::split(stream);
+    let mut line = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
     line.push(b'\n');
     write_half
         .write_all(&line)
@@ -1098,9 +1129,22 @@ async fn send_request(request: &CliRequest) -> Result<CliResponse, String> {
 }
 
 // ---------------------------------------------------------------------------
-// Control socket
+// Control endpoint
 // ---------------------------------------------------------------------------
 
+/// Human-readable description of the control endpoint.
+pub fn endpoint_display() -> String {
+    #[cfg(unix)]
+    {
+        socket_path().display().to_string()
+    }
+    #[cfg(windows)]
+    {
+        format!("127.0.0.1 via {}", control_path().display())
+    }
+}
+
+#[cfg(unix)]
 /// `$XDG_RUNTIME_DIR/larp-music-player.sock`, falling back to the config dir.
 pub fn socket_path() -> PathBuf {
     if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
@@ -1110,6 +1154,78 @@ pub fn socket_path() -> PathBuf {
         }
     }
     paths::config_dir().join("player.sock")
+}
+
+#[cfg(windows)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ControlFile {
+    port: u16,
+    token: String,
+}
+
+/// Windows has no Unix domain sockets in `std`/Tokio, so the TUI listens on
+/// a random loopback port. The port and an unguessable token are written to
+/// a per-user file; the token stops unrelated local processes from driving
+/// the player.
+#[cfg(windows)]
+fn control_path() -> PathBuf {
+    paths::data_dir().join("player-control.json")
+}
+
+#[cfg(windows)]
+fn read_control_file() -> Result<ControlFile, String> {
+    let path = control_path();
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        format!(
+            "cannot read {}: {e}. Start the player with `larp-music-player` first.",
+            path.display()
+        )
+    })?;
+    serde_json::from_str(&text).map_err(|e| format!("invalid control file {}: {e}", path.display()))
+}
+
+#[cfg(windows)]
+fn control_is_alive(path: &std::path::Path) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(control) = serde_json::from_str::<ControlFile>(&text) else {
+        return false;
+    };
+    let addr = std::net::SocketAddr::from(([127, 0, 0, 1], control.port));
+    std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
+}
+
+#[cfg(windows)]
+fn random_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u32(std::process::id());
+    hasher.write_u128(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default(),
+    );
+    format!("{:016x}{:016x}", hasher.finish(), std::process::id())
+}
+
+#[cfg(windows)]
+fn write_control_file(path: &std::path::Path, port: u16, token: &str) -> Result<(), String> {
+    let text = serde_json::to_vec(&ControlFile {
+        port,
+        token: token.to_string(),
+    })
+    .map_err(|e| e.to_string())?;
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, text).map_err(|e| format!("cannot write {}: {e}", tmp.display()))?;
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(format!("cannot install {}: {e}", path.display()));
+    }
+    Ok(())
 }
 
 pub struct SocketGuard {
@@ -1123,7 +1239,8 @@ impl Drop for SocketGuard {
 }
 
 /// Start listening for CLI requests. Returns `None` when another instance is
-/// already running (the existing socket stays untouched).
+/// already running (the existing endpoint stays untouched).
+#[cfg(unix)]
 pub fn start_server(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> Option<SocketGuard> {
     let path = socket_path();
     if let Some(parent) = path.parent() {
@@ -1146,7 +1263,6 @@ pub fn start_server(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> Option<SocketG
             return None;
         }
     };
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
@@ -1169,7 +1285,7 @@ pub fn start_server(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> Option<SocketG
                 Ok((stream, _)) => {
                     let tx = cmd_tx.clone();
                     tokio::spawn(async move {
-                        serve_connection(stream, tx).await;
+                        serve_connection(stream, tx, None).await;
                     });
                 }
                 Err(e) => {
@@ -1183,10 +1299,81 @@ pub fn start_server(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> Option<SocketG
     Some(SocketGuard { path })
 }
 
-async fn serve_connection(
-    mut stream: tokio::net::UnixStream,
+#[cfg(windows)]
+pub fn start_server(cmd_tx: mpsc::UnboundedSender<AppCommand>) -> Option<SocketGuard> {
+    let path = control_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    if control_is_alive(&path) {
+        crate::dlog!(
+            "[cli] another instance is already listening via {}",
+            path.display()
+        );
+        return None;
+    }
+    let _ = std::fs::remove_file(&path);
+
+    let listener = match std::net::TcpListener::bind(("127.0.0.1", 0)) {
+        Ok(listener) => listener,
+        Err(e) => {
+            crate::dlog!("[cli] cannot bind loopback: {}", e);
+            return None;
+        }
+    };
+    let port = match listener.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(e) => {
+            crate::dlog!("[cli] cannot read loopback address: {}", e);
+            return None;
+        }
+    };
+    if let Err(e) = listener.set_nonblocking(true) {
+        crate::dlog!("[cli] cannot make listener non-blocking: {}", e);
+        return None;
+    }
+    let listener = match tokio::net::TcpListener::from_std(listener) {
+        Ok(listener) => listener,
+        Err(e) => {
+            crate::dlog!("[cli] cannot register listener: {}", e);
+            return None;
+        }
+    };
+    let token = random_token();
+    if let Err(e) = write_control_file(&path, port, &token) {
+        crate::dlog!("[cli] {}", e);
+        return None;
+    }
+
+    tokio::spawn(async move {
+        loop {
+            match listener.accept().await {
+                Ok((stream, _)) => {
+                    let tx = cmd_tx.clone();
+                    let expected = token.clone();
+                    tokio::spawn(async move {
+                        serve_connection(stream, tx, Some(expected)).await;
+                    });
+                }
+                Err(e) => {
+                    crate::dlog!("[cli] accept error: {}", e);
+                    break;
+                }
+            }
+        }
+    });
+
+    Some(SocketGuard { path })
+}
+
+async fn serve_connection<S>(
+    mut stream: S,
     cmd_tx: mpsc::UnboundedSender<AppCommand>,
-) {
+    expected_token: Option<String>,
+) where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let parsed = {
         let mut reader = BufReader::new(&mut stream);
         let mut line = String::new();
@@ -1206,6 +1393,17 @@ async fn serve_connection(
             return;
         }
     };
+
+    if let Some(expected) = expected_token.as_deref() {
+        if request.token.as_deref() != Some(expected) {
+            let _ = write_response(
+                &mut stream,
+                CliResponse::err("unauthorized control request"),
+            )
+            .await;
+            return;
+        }
+    }
 
     let (reply_tx, reply_rx) = oneshot::channel();
     if cmd_tx
@@ -1227,10 +1425,10 @@ async fn serve_connection(
     let _ = write_response(&mut stream, response).await;
 }
 
-async fn write_response(
-    stream: &mut tokio::net::UnixStream,
-    response: CliResponse,
-) -> std::io::Result<()> {
+async fn write_response<S>(stream: &mut S, response: CliResponse) -> std::io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let mut line = serde_json::to_vec(&response)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     line.push(b'\n');

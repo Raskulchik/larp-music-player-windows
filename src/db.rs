@@ -572,7 +572,10 @@ mod tests {
     #[test]
     fn local_tracks_can_be_liked_and_added_to_playlist() {
         let db = temp_db("local");
-        let path = format!("/tmp/opencode/__local_{}.mp3", std::process::id());
+        let path = std::env::temp_dir()
+            .join(format!("__local_{}.mp3", std::process::id()))
+            .to_string_lossy()
+            .into_owned();
         let track = Track {
             id: path.clone(),
             title: "Local Song".to_string(),

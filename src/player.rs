@@ -311,7 +311,14 @@ fn download_with_progress(
 
     let mut child = std::process::Command::new("curl")
         .args(["-sL", "--max-time", "60", "-w", "\n%{size_download}\n%{speed_download}"])
-        .args(["-H", "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"])
+        .args([
+            "-H",
+            if cfg!(windows) {
+                "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+            } else {
+                "User-Agent: Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36"
+            },
+        ])
         .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

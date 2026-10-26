@@ -6,6 +6,10 @@ mod db;
 mod discord_rpc;
 mod local;
 mod log;
+#[cfg(unix)]
+mod mpris;
+#[cfg(windows)]
+#[path = "mpris_stub.rs"]
 mod mpris;
 mod paths;
 mod player;
@@ -78,6 +82,26 @@ fn downloads_dir() -> std::path::PathBuf {
     paths::downloads_dir()
 }
 
+fn temp_media_path(prefix: &str, track_id: &str) -> String {
+    std::env::temp_dir()
+        .join(format!("{prefix}_{}.mp3", sanitize_filename(track_id)))
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Use UTF-8 in the Windows console so Cyrillic titles and box drawing render
+/// correctly in both Windows Terminal and the legacy console host.
+#[cfg(windows)]
+fn configure_console() {
+    unsafe {
+        windows_sys::Win32::System::Console::SetConsoleOutputCP(65001);
+        windows_sys::Win32::System::Console::SetConsoleCP(65001);
+    }
+}
+
+#[cfg(not(windows))]
+fn configure_console() {}
+
 fn sanitize_filename(s: &str) -> String {
     s.chars()
         .map(|c| match c {
@@ -127,6 +151,7 @@ fn lower_char(c: char) -> char {
     }
 }
 
+#[cfg(unix)]
 fn check_bluetooth_device() -> Option<String> {
     let out = std::process::Command::new("bluetoothctl")
         .args(["devices", "Connected"])
@@ -544,7 +569,7 @@ fn play_track(
                 let track_id = app.get_current_track_id().unwrap_or_default();
                 tokio::spawn(async move {
                     let _ = cmd_tx2.send(app::Command::DownloadProgress(0));
-                    let tmp_path = format!("/tmp/sc_{}.mp3", track_id);
+                    let tmp_path = temp_media_path("sc", &track_id);
                     let result = tokio::task::spawn_blocking({
                         let tmp_path = tmp_path.clone();
                         move || {
@@ -620,7 +645,7 @@ fn play_track(
                 let track_id = app.get_current_track_id().unwrap_or_default();
                 tokio::spawn(async move {
                     let _ = cmd_tx2.send(app::Command::DownloadProgress(0));
-                    let tmp_path = format!("/tmp/ytm_{}.mp3", track_id);
+                    let tmp_path = temp_media_path("ytm", &track_id);
                     let result = tokio::task::spawn_blocking({
                         let tmp_path = tmp_path.clone();
                         move || {
@@ -1234,6 +1259,8 @@ async fn handle_cli_request(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    configure_console();
+
     // Any argument switches to CLI mode; no arguments opens the TUI.
     let args: Vec<String> = std::env::args().skip(1).collect();
     if !args.is_empty() {
@@ -1295,6 +1322,7 @@ async fn main() -> anyhow::Result<()> {
     start_update_check(&cfg, &cmd_tx);
     let (player_tx, player_handle) = player::start(cmd_tx.clone());
 
+    #[cfg(unix)]
     {
         let bt_tx = cmd_tx.clone();
         std::thread::spawn(move || {
@@ -1308,6 +1336,10 @@ async fn main() -> anyhow::Result<()> {
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
         });
+    }
+    #[cfg(windows)]
+    {
+        let _ = cmd_tx.send(app::Command::BluetoothStatus(None));
     }
 
     let (mpris_tx, mut mpris_rx) = mpsc::unbounded_channel::<mpris::MprisCommand>();

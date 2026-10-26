@@ -64,31 +64,36 @@ mod tests {
 
     #[test]
     fn tag_and_read() {
-        let path = std::path::Path::new("/tmp/opencode/test.mp3");
-        if !path.exists() {
-            let ok = std::process::Command::new("ffmpeg")
-                .args([
-                    "-y",
-                    "-f",
-                    "lavfi",
-                    "-i",
-                    "sine=frequency=440:duration=1",
-                    "-codec:a",
-                    "libmp3lame",
-                    "-q:a",
-                    "9",
-                    "/tmp/opencode/test.mp3",
-                ])
-                .output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if !ok {
-                eprintln!("skipping: ffmpeg not available");
-                return;
-            }
+        let path = std::env::temp_dir().join(format!(
+            "larp_tag_test_{}_{}.mp3",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let ok = std::process::Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                "sine=frequency=440:duration=1",
+                "-codec:a",
+                "libmp3lame",
+                "-q:a",
+                "9",
+            ])
+            .arg(&path)
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            eprintln!("skipping: ffmpeg not available");
+            return;
         }
         tag_file(
-            path,
+            &path,
             "Test Artist",
             "Test Title",
             Some("Test Album"),
@@ -96,7 +101,8 @@ mod tests {
         )
         .unwrap();
 
-        let tf = lofty::read_from_path(path).unwrap();
+        let tf = lofty::read_from_path(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
         let tag = tf.primary_tag().unwrap();
         assert_eq!(tag.artist().as_deref(), Some("Test Artist"));
         assert_eq!(tag.title().as_deref(), Some("Test Title"));

@@ -1,43 +1,100 @@
-//! XDG base-directory helpers.
+//! Platform base-directory helpers.
 //!
-//! Music (decoded PCM cache and downloaded tracks) lives in the *data* dir
-//! (`~/.local/share/music-player-tui`), not in `~/.cache` — the cache is
-//! meant to be disposable, while this data is worth keeping.
+//! Music (decoded PCM cache and downloaded tracks) lives in the *data* dir,
+//! not in a disposable cache — decoded audio is expensive to rebuild, while
+//! downloads are worth keeping. On Unix this follows the XDG layout; on
+//! Windows it uses `%LOCALAPPDATA%` and `%APPDATA%`.
 
 use std::path::{Path, PathBuf};
 
 pub const APP_NAME: &str = "music-player-tui";
 
-fn home() -> PathBuf {
-    std::env::var("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("."))
+/// The current user's home directory.
+pub fn home_dir() -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(home) = std::env::var_os("USERPROFILE").filter(|v| !v.is_empty()) {
+            return PathBuf::from(home);
+        }
+        let drive = std::env::var_os("HOMEDRIVE").unwrap_or_default();
+        let path = std::env::var_os("HOMEPATH").unwrap_or_default();
+        if !drive.is_empty() || !path.is_empty() {
+            return PathBuf::from(format!(
+                "{}{}",
+                drive.to_string_lossy(),
+                path.to_string_lossy()
+            ));
+        }
+    }
+
+    #[cfg(not(windows))]
+    if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+        return PathBuf::from(home);
+    }
+
+    PathBuf::from(".")
 }
 
-/// `$XDG_DATA_HOME/music-player-tui` (default `~/.local/share/music-player-tui`).
-/// Holds the decoded audio cache and the offline downloads.
+/// Platform data directory, holding the decoded audio cache and downloads.
+///
+/// Unix: `$XDG_DATA_HOME/music-player-tui` (default `~/.local/share/music-player-tui`).
+/// Windows: `%LOCALAPPDATA%\music-player-tui`.
 pub fn data_dir() -> PathBuf {
-    if let Ok(x) = std::env::var("XDG_DATA_HOME") {
-        if !x.is_empty() {
+    #[cfg(windows)]
+    {
+        if let Some(x) = std::env::var_os("LOCALAPPDATA").filter(|v| !v.is_empty()) {
             return PathBuf::from(x).join(APP_NAME);
         }
+        return home_dir().join("AppData").join("Local").join(APP_NAME);
     }
-    home().join(".local").join("share").join(APP_NAME)
+
+    #[cfg(not(windows))]
+    {
+        if let Ok(x) = std::env::var("XDG_DATA_HOME") {
+            if !x.is_empty() {
+                return PathBuf::from(x).join(APP_NAME);
+            }
+        }
+        home_dir().join(".local").join("share").join(APP_NAME)
+    }
 }
 
-/// Pre-v0.3.0 location: `~/.cache/music-player-tui`.
+/// Pre-v0.3.0 location. Only Unix had the legacy cache layout.
 pub fn legacy_cache_dir() -> PathBuf {
-    home().join(".cache").join(APP_NAME)
+    #[cfg(windows)]
+    {
+        // A path that intentionally does not exist on Windows.
+        data_dir().join(".legacy-cache")
+    }
+
+    #[cfg(not(windows))]
+    {
+        home_dir().join(".cache").join(APP_NAME)
+    }
 }
 
-/// `$XDG_CONFIG_HOME/music-player-tui` (default `~/.config/music-player-tui`).
+/// Platform config directory.
+///
+/// Unix: `$XDG_CONFIG_HOME/music-player-tui` (default `~/.config/music-player-tui`).
+/// Windows: `%APPDATA%\music-player-tui`.
 pub fn config_dir() -> PathBuf {
-    if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
-        if !x.is_empty() {
+    #[cfg(windows)]
+    {
+        if let Some(x) = std::env::var_os("APPDATA").filter(|v| !v.is_empty()) {
             return PathBuf::from(x).join(APP_NAME);
         }
+        return home_dir().join("AppData").join("Roaming").join(APP_NAME);
     }
-    home().join(".config").join(APP_NAME)
+
+    #[cfg(not(windows))]
+    {
+        if let Ok(x) = std::env::var("XDG_CONFIG_HOME") {
+            if !x.is_empty() {
+                return PathBuf::from(x).join(APP_NAME);
+            }
+        }
+        home_dir().join(".config").join(APP_NAME)
+    }
 }
 
 /// The offline library: music downloaded by the app (`<data>/downloads`).

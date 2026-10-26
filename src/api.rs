@@ -639,13 +639,42 @@ pub struct YtMeta {
 }
 
 fn ytmeta_script() -> Option<std::path::PathBuf> {
-    let candidates = [
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ytmeta.py"),
-        std::env::current_exe().ok()?.parent()?.join("ytmeta.py"),
-        std::path::PathBuf::from("/usr/share/larp-music-player/ytmeta.py"),
-        std::path::PathBuf::from(env!("HOME")).join(".config/music-player-tui/ytmeta.py"),
-    ];
+    let mut candidates = vec![std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ytmeta.py")];
+    if let Some(exe) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    {
+        candidates.push(exe.join("ytmeta.py"));
+    }
+    #[cfg(unix)]
+    candidates.push(std::path::PathBuf::from(
+        "/usr/share/larp-music-player/ytmeta.py",
+    ));
+    candidates.push(crate::paths::config_dir().join("ytmeta.py"));
     candidates.into_iter().find(|p| p.exists())
+}
+
+fn python_command() -> std::process::Command {
+    let venv = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join(".venv")
+        .join(if cfg!(windows) { "Scripts" } else { "bin" })
+        .join(if cfg!(windows) {
+            "python.exe"
+        } else {
+            "python"
+        });
+    if venv.exists() {
+        return std::process::Command::new(venv);
+    }
+
+    #[cfg(windows)]
+    {
+        std::process::Command::new("python")
+    }
+    #[cfg(not(windows))]
+    {
+        std::process::Command::new("python3")
+    }
 }
 
 /// Fetch accurate duration + big artwork for any source via the Python helper.
@@ -663,11 +692,7 @@ pub async fn get_meta(source: Source, id: &str, extra: Option<&str>) -> Option<Y
     let id = id.to_string();
     let extra = extra.map(|s| s.to_string());
     tokio::task::spawn_blocking(move || {
-        let mut cmd = std::process::Command::new("python3");
-        let venv = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(".venv/bin/python");
-        if venv.exists() {
-            cmd = std::process::Command::new(venv);
-        }
+        let mut cmd = python_command();
         cmd.arg(&script).arg(src).arg(&id);
         if let Some(e) = &extra {
             cmd.arg(e);

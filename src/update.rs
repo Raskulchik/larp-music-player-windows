@@ -1,6 +1,6 @@
 use serde::Deserialize;
 
-pub const REPO: &str = "Raskulchik/larp-music-player";
+pub const REPO: &str = "Raskulchik/larp-music-player-windows";
 
 fn api_url() -> String {
     format!("https://api.github.com/repos/{}/releases/latest", REPO)
@@ -78,7 +78,16 @@ pub async fn check() -> Option<(String, String)> {
 }
 
 pub fn open_in_browser(url: &str) {
-    let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(url).spawn();
+    }
 }
 
 #[cfg(test)]

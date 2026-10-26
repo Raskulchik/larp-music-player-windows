@@ -16,7 +16,7 @@ import re
 import sys
 import urllib.request
 
-UA = "larp-music-player/0.1 (linux)"
+UA = "larp-music-player/0.4 (" + ("windows" if sys.platform.startswith("win") else "unix") + ")"
 
 
 def http_json(url, token=None, client_id=None):

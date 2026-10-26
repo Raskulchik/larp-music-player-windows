@@ -4,18 +4,17 @@ on:
   push:
     tags:
       - 'v*'
-  workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev ffmpeg
+      - name: Install ffmpeg
+        run: choco install ffmpeg --yes --no-progress
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build
@@ -25,27 +24,28 @@ jobs:
 
   release:
     needs: test
-    runs-on: ubuntu-latest
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install system deps
-        run: sudo apt-get update && sudo apt-get install -y pkg-config libasound2-dev ffmpeg
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Build release binary
         run: cargo build --release --locked
-      - name: Package (binary + ytmeta.py)
+      - name: Package (exe + ytmeta.py + README)
+        shell: pwsh
         run: |
-          mkdir -p dist
-          cp target/release/larp-music-player dist/
-          cp ytmeta.py dist/
-          tar -czf larp-music-player-linux-x86_64.tar.gz -C dist .
-          sha256sum larp-music-player-linux-x86_64.tar.gz > larp-music-player-linux-x86_64.tar.gz.sha256
-          cat larp-music-player-linux-x86_64.tar.gz.sha256
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/larp-music-player.exe dist/
+          Copy-Item ytmeta.py dist/
+          Copy-Item README.md dist/
+          Compress-Archive -Path dist/* -DestinationPath larp-music-player-windows-x86_64.zip -Force
+          $hash = (Get-FileHash larp-music-player-windows-x86_64.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  larp-music-player-windows-x86_64.zip" | Set-Content -Encoding ascii larp-music-player-windows-x86_64.zip.sha256
+          Get-Content larp-music-player-windows-x86_64.zip.sha256
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            larp-music-player-linux-x86_64.tar.gz
-            larp-music-player-linux-x86_64.tar.gz.sha256
+            larp-music-player-windows-x86_64.zip
+            larp-music-player-windows-x86_64.zip.sha256
           generate_release_notes: true

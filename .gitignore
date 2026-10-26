@@ -3,3 +3,7 @@
 /dist
 /larp-music-player-linux-x86_64.tar.gz
 /larp-music-player-linux-x86_64.tar.gz.sha256
+/larp-music-player-windows-x86_64.zip
+/larp-music-player-windows-x86_64.zip.sha256
+*.exe
+*.pdb
